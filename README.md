@@ -18,8 +18,8 @@ Here's an example of what you can do when it's connected to Claude.
 
 ### Prerequisites
 
-- Go
-- Python 3.6+
+- Go 1.26+ (the bridge pins a patched toolchain in `go.mod`; `go` downloads it automatically)
+- Python 3.11+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
@@ -44,6 +44,8 @@ Here's an example of what you can do when it's connected to Claude.
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
+   On first run the bridge also generates a random API token in `whatsapp-bridge/store/api_token` (readable only by your user). The MCP server reads this file automatically; nothing to configure. The bridge's REST API only listens on `127.0.0.1:8080`.
+
    After approximately 20 days, you will might need to re-authenticate.
 
 3. **Connect to the MCP server**
@@ -61,6 +63,23 @@ Here's an example of what you can do when it's connected to Claude.
            "run",
            "main.py"
          ]
+       }
+     }
+   }
+   ```
+
+   Optional hardening settings go in an `env` block (see [Security](#security) for what each one does):
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "{{PATH_TO_UV}}",
+         "args": ["--directory", "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"],
+         "env": {
+           "WHATSAPP_MEDIA_DIRS": "/Users/you/Pictures:/Users/you/Documents/to-send",
+           "WHATSAPP_MCP_READ_ONLY": "0"
+         }
        }
      }
    }
@@ -120,6 +139,46 @@ This application consists of two main components:
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
 
+## Security
+
+This project gives an AI agent read access to your private messages and the ability to send messages as you. The design below limits what can go wrong, but read the caution at the top of this README: an attacker who can message you can try to prompt-inject the agent.
+
+### What is enforced
+
+- **Loopback only.** The bridge's REST API binds to `127.0.0.1` and rejects requests whose `Host` header is not a loopback address (blocks DNS-rebinding). It also requires `Content-Type: application/json` and a bearer token, which together stop a web page in your browser from calling it.
+- **Bearer token.** Generated on first run into `whatsapp-bridge/store/api_token` (mode 600). Every API call must present it. The MCP server reads the file; set `WHATSAPP_API_TOKEN` on both sides to use your own.
+- **Media allow-list.** Files can only be sent from `whatsapp-bridge/store/` plus directories listed in `WHATSAPP_MEDIA_DIRS` (colon-separated on macOS/Linux, semicolon on Windows). Symlinks are resolved before checking. The bridge enforces this independently of the MCP server, and the check runs before any filesystem access so the API cannot be used to probe for files. Without this, a prompt-injected agent could send `~/.ssh/id_rsa` to an attacker.
+- **Safe downloads.** Filenames chosen by remote senders are sanitized and downloads are confined to `whatsapp-bridge/store/`.
+- **Rate limit.** At most `WHATSAPP_SEND_RATE_LIMIT` sends per minute (default 20, 0 disables).
+- **Size limits.** Media larger than `WHATSAPP_MAX_MEDIA_BYTES` (default 64 MiB) and messages over 64k characters are rejected; request bodies are capped at 1 MiB; the HTTP server has read/write/idle timeouts.
+- **Recipient validation.** Phone numbers must be digits only; JIDs must be on a known WhatsApp server.
+- **File permissions.** `store/` is created mode 700 and the databases, token and downloaded media mode 600. `whatsapp.db` holds your Signal session keys: anyone who can read it can act as your WhatsApp account.
+- **Read-only database access.** The MCP server opens `messages.db` read-only; pagination arguments from the agent are clamped.
+- **Quiet logs.** The bridge logs message metadata (chat, direction, type), never message bodies.
+- **Read-only mode.** Set `WHATSAPP_MCP_READ_ONLY=1` in the MCP server's environment and the send tools are not registered at all. Use this if you only want the agent to read and search.
+- **Tool annotations.** Read tools are marked `readOnlyHint`; send tools are marked `openWorldHint` so clients that support it can ask for confirmation.
+- **Dependencies.** Both the Go and Python dependency sets are pinned to versions with no known vulnerabilities as of October 2026 (`govulncheck` and `pip-audit` clean).
+
+### Configuration reference
+
+| Variable | Where | Default | Purpose |
+|---|---|---|---|
+| `WHATSAPP_API_TOKEN` | both | file `store/api_token` | Shared secret for the bridge API (min 32 chars) |
+| `WHATSAPP_MEDIA_DIRS` | both | *(none)* | Extra directories files may be sent from |
+| `WHATSAPP_MCP_READ_ONLY` | MCP server | `0` | `1` disables all send tools |
+| `WHATSAPP_BRIDGE_ADDR` | bridge | `127.0.0.1:8080` | Listen address. Non-loopback values disable the Host check and expose the API to the network; not recommended |
+| `WHATSAPP_API_BASE_URL` | MCP server | `http://127.0.0.1:8080/api` | Where the MCP server finds the bridge |
+| `WHATSAPP_BRIDGE_STORE` | MCP server | `../whatsapp-bridge/store` | Path to the bridge store directory |
+| `WHATSAPP_SEND_RATE_LIMIT` | bridge | `20` | Max sends per minute, `0` to disable |
+| `WHATSAPP_MAX_MEDIA_BYTES` | bridge | `67108864` | Max size of a file to send |
+| `WHATSAPP_API_TIMEOUT` | MCP server | `180` | Seconds to wait for the bridge |
+
+### What is not covered
+
+- **Prompt injection.** Message content returned to the agent is untrusted. The server tells the model this in its instructions, but that is advice, not enforcement. Read-only mode and the media allow-list are the real controls.
+- **Encryption at rest.** The SQLite databases are not encrypted. Full-disk encryption and the 600/700 permissions are what protect them.
+- **Other processes running as you.** Anything running under your user account can read the token and the databases.
+
 ## Usage
 
 Once connected, you can interact with your WhatsApp contacts through Claude, leveraging Claude's AI capabilities in your WhatsApp conversations.
@@ -149,7 +208,7 @@ The MCP server supports both sending and receiving various media types:
 
 You can send various media types to your WhatsApp contacts:
 
-- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type.
+- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type. Files must live under `whatsapp-bridge/store/` or a directory listed in `WHATSAPP_MEDIA_DIRS` (see [Security](#security)).
 - **Voice Messages**: Use the `send_audio_message` tool to send audio files as playable WhatsApp voice messages.
   - For optimal compatibility, audio files should be in `.ogg` Opus format.
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
@@ -171,6 +230,9 @@ By default, just the metadata of the media is stored in the local database. The 
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
 - Make sure both the Go application and the Python server are running for the integration to work properly.
+- **"Bridge API token not found"** or **HTTP 401**: start the bridge once so it creates `whatsapp-bridge/store/api_token`, or set the same `WHATSAPP_API_TOKEN` for both the bridge and the MCP server. If you moved the store directory, set `WHATSAPP_BRIDGE_STORE` for the MCP server.
+- **"media_path is outside the allowed media directories"**: add the directory to `WHATSAPP_MEDIA_DIRS` for both the bridge and the MCP server, then restart both.
+- **"Send rate limit exceeded"**: the bridge caps sends per minute; raise `WHATSAPP_SEND_RATE_LIMIT` if you need more.
 
 ### Authentication Issues
 
