@@ -63,7 +63,14 @@ type SecurityConfig struct {
 	MaxMediaBytes    int64
 	BindAddr         string
 	EnforceLoopback  bool // reject requests whose Host header is not a loopback address
-	limiter          *rateLimiter
+	// AllowedRecipients, when non-empty, is the only set of JIDs messages may be sent to.
+	AllowedRecipients map[string]bool
+	// KnownChatsOnly restricts sending to chats that already exist in the message store.
+	KnownChatsOnly bool
+	// AuditLogPath receives one JSON line per send attempt; empty disables it.
+	AuditLogPath string
+	limiter      *rateLimiter
+	auditMu      sync.Mutex
 }
 
 // rateLimiter is a small sliding-window limiter used to cap outbound sends.
@@ -314,6 +321,69 @@ func parseRecipient(recipient string) (types.JID, error) {
 	return types.NewJID(recipient, types.DefaultUserServer), nil
 }
 
+// parseRecipientList parses WHATSAPP_ALLOWED_RECIPIENTS: a comma-separated
+// list of phone numbers or JIDs.
+func parseRecipientList(raw string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		jid, err := parseRecipient(item)
+		if err != nil {
+			return nil, fmt.Errorf("WHATSAPP_ALLOWED_RECIPIENTS entry %q: %w", item, err)
+		}
+		out[jid.ToNonAD().String()] = true
+	}
+	return out, nil
+}
+
+// recipientAllowed applies the optional recipient allow-list and the
+// known-chats-only rule. isKnownChat is injected so the rule can be tested
+// without a database.
+func (sc *SecurityConfig) recipientAllowed(jid types.JID, isKnownChat func(string) bool) error {
+	key := jid.ToNonAD().String()
+	if len(sc.AllowedRecipients) > 0 && !sc.AllowedRecipients[key] {
+		return fmt.Errorf("recipient %s is not in WHATSAPP_ALLOWED_RECIPIENTS", key)
+	}
+	if sc.KnownChatsOnly && (isKnownChat == nil || !isKnownChat(key)) {
+		return fmt.Errorf("recipient %s is not an existing chat and WHATSAPP_SEND_KNOWN_CHATS_ONLY is set", key)
+	}
+	return nil
+}
+
+type auditEntry struct {
+	Time         string `json:"time"`
+	Recipient    string `json:"recipient"`
+	Kind         string `json:"kind"`
+	Media        string `json:"media,omitempty"`
+	MessageChars int    `json:"message_chars"`
+	Success      bool   `json:"success"`
+	Result       string `json:"result"`
+}
+
+// audit appends one JSON line per send attempt so the user can see exactly
+// what the agent tried to send. Message bodies are never written.
+func (sc *SecurityConfig) audit(e auditEntry) {
+	if sc.AuditLogPath == "" {
+		return
+	}
+	e.Time = time.Now().UTC().Format(time.RFC3339)
+	line, err := json.Marshal(e)
+	if err != nil {
+		return
+	}
+	sc.auditMu.Lock()
+	defer sc.auditMu.Unlock()
+	f, err := os.OpenFile(sc.AuditLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(line, '\n'))
+}
+
 func isLoopbackHost(host string) bool {
 	h := host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
@@ -399,6 +469,14 @@ func envInt(name string, def int) int {
 	return n
 }
 
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 func loadSecurityConfig(logger waLog.Logger) (*SecurityConfig, error) {
 	if err := ensurePrivateDir(storeDirName); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %w", err)
@@ -440,7 +518,23 @@ func loadSecurityConfig(logger waLog.Logger) (*SecurityConfig, error) {
 		EnforceLoopback:  enforceLoopback,
 		limiter:          newRateLimiter(envInt("WHATSAPP_SEND_RATE_LIMIT", defaultSendsPerMinute), time.Minute),
 	}
+
+	sc.AllowedRecipients, err = parseRecipientList(os.Getenv("WHATSAPP_ALLOWED_RECIPIENTS"))
+	if err != nil {
+		return nil, err
+	}
+	sc.KnownChatsOnly = envBool("WHATSAPP_SEND_KNOWN_CHATS_ONLY")
+	if !envBool("WHATSAPP_DISABLE_AUDIT_LOG") {
+		sc.AuditLogPath = filepath.Join(storeDir, "send_audit.log")
+	}
+
 	logger.Infof("Media may be sent from: %s", strings.Join(sc.AllowedMediaDirs, ", "))
+	if len(sc.AllowedRecipients) > 0 {
+		logger.Infof("Sending restricted to %d allow-listed recipient(s)", len(sc.AllowedRecipients))
+	}
+	if sc.KnownChatsOnly {
+		logger.Infof("Sending restricted to existing chats")
+	}
 	return sc, nil
 }
 
@@ -521,6 +615,13 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// HasChat reports whether a chat with this JID exists in the store.
+func (store *MessageStore) HasChat(jid string) bool {
+	var one int
+	err := store.db.QueryRow("SELECT 1 FROM chats WHERE jid = ? LIMIT 1", jid).Scan(&one)
+	return err == nil
 }
 
 // Store a message in the database
@@ -622,13 +723,16 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, sc *SecurityConfig, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, sc *SecurityConfig, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
 
 	recipientJID, err := parseRecipient(recipient)
 	if err != nil {
+		return false, err.Error()
+	}
+	if err := sc.recipientAllowed(recipientJID, messageStore.HasChat); err != nil {
 		return false, err.Error()
 	}
 
@@ -959,6 +1063,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, sc *Sec
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
+	if fileLength > uint64(sc.MaxMediaBytes) {
+		return false, "", "", "", fmt.Errorf("media is %d bytes, over the %d byte limit (WHATSAPP_MAX_MEDIA_BYTES)", fileLength, sc.MaxMediaBytes)
+	}
 
 	directPath := extractDirectPathFromURL(url)
 
@@ -1062,7 +1169,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, sc *S
 		}
 		logger.Infof("Send request: recipient=%s kind=%s", req.Recipient, kind)
 
-		success, message := sendWhatsAppMessage(client, sc, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, sc, req.Recipient, req.Message, req.MediaPath)
+
+		media := ""
+		if req.MediaPath != "" {
+			media = filepath.Base(req.MediaPath)
+		}
+		sc.audit(auditEntry{
+			Recipient:    req.Recipient,
+			Kind:         kind,
+			Media:        media,
+			MessageChars: len(req.Message),
+			Success:      success,
+			Result:       message,
+		})
 
 		status := http.StatusOK
 		if !success {

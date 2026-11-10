@@ -289,21 +289,43 @@ def get_sender_name(sender_jid: str) -> str:
         return sender_jid
 
 
+def _display_name(name: Optional[str], limit: int = 80) -> str:
+    """Flatten a remote-controlled name onto one printable line.
+
+    Contact and group names are chosen by other people. Without this, a name
+    containing a newline could forge a whole fake message line in the output.
+    """
+    if not name:
+        return ""
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in str(name))
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:limit]
+
+
+def _display_content(content: Optional[str]) -> str:
+    """Indent continuation lines so message bodies cannot start a fake header line."""
+    if not content:
+        return ""
+    return str(content).replace("\r", "").replace("\n", "\n    ")
+
+
 def format_message(message: Message, show_chat_info: bool = True) -> str:
-    """Format a single message. Message bodies are untrusted remote input."""
+    """Format a single message. Message bodies and names are untrusted remote input."""
     output = ""
 
-    if show_chat_info and message.chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
+    chat_name = _display_name(message.chat_name)
+    if show_chat_info and chat_name:
+        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
 
     content_prefix = ""
     if message.media_type:
-        content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        media_type = _display_name(message.media_type, 20)
+        content_prefix = f"[{media_type} - Message ID: {_display_name(message.id)} - Chat JID: {_display_name(message.chat_jid)}] "
 
-    sender_name = "Me" if message.is_from_me else get_sender_name(message.sender)
-    output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+    sender_name = "Me" if message.is_from_me else _display_name(get_sender_name(message.sender))
+    output += f"From: {sender_name}: {content_prefix}{_display_content(message.content)}\n"
     return output
 
 

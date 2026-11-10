@@ -149,15 +149,27 @@ This project gives an AI agent read access to your private messages and the abil
 - **Bearer token.** Generated on first run into `whatsapp-bridge/store/api_token` (mode 600). Every API call must present it. The MCP server reads the file; set `WHATSAPP_API_TOKEN` on both sides to use your own.
 - **Media allow-list.** Files can only be sent from `whatsapp-bridge/store/` plus directories listed in `WHATSAPP_MEDIA_DIRS` (colon-separated on macOS/Linux, semicolon on Windows). Symlinks are resolved before checking. The bridge enforces this independently of the MCP server, and the check runs before any filesystem access so the API cannot be used to probe for files. Without this, a prompt-injected agent could send `~/.ssh/id_rsa` to an attacker.
 - **Safe downloads.** Filenames chosen by remote senders are sanitized and downloads are confined to `whatsapp-bridge/store/`.
+- **Recipient controls.** `WHATSAPP_ALLOWED_RECIPIENTS` (comma-separated numbers or JIDs) limits who the agent can ever message. `WHATSAPP_SEND_KNOWN_CHATS_ONLY=1` limits sending to chats that already exist in your history, so an injected instruction cannot open a conversation with a stranger's number. Both are off by default; either one is a strong defence against text exfiltration.
+- **Send audit log.** Every send attempt is appended as a JSON line to `whatsapp-bridge/store/send_audit.log` (time, recipient, kind, media filename, message length, outcome). Message bodies are not written. Set `WHATSAPP_DISABLE_AUDIT_LOG=1` to turn it off.
 - **Rate limit.** At most `WHATSAPP_SEND_RATE_LIMIT` sends per minute (default 20, 0 disables).
-- **Size limits.** Media larger than `WHATSAPP_MAX_MEDIA_BYTES` (default 64 MiB) and messages over 64k characters are rejected; request bodies are capped at 1 MiB; the HTTP server has read/write/idle timeouts.
+- **Size limits.** Media larger than `WHATSAPP_MAX_MEDIA_BYTES` (default 64 MiB) is refused both for sending and for downloading; messages over 64k characters are rejected; request bodies are capped at 1 MiB; the HTTP server has read/write/idle timeouts.
+- **Output hardening.** Contact and group names are flattened to one printable line and multi-line message bodies are indented before being shown to the agent, so a sender cannot forge a fake "From: Me" line inside the tool output.
 - **Recipient validation.** Phone numbers must be digits only; JIDs must be on a known WhatsApp server.
 - **File permissions.** `store/` is created mode 700 and the databases, token and downloaded media mode 600. `whatsapp.db` holds your Signal session keys: anyone who can read it can act as your WhatsApp account.
 - **Read-only database access.** The MCP server opens `messages.db` read-only; pagination arguments from the agent are clamped.
 - **Quiet logs.** The bridge logs message metadata (chat, direction, type), never message bodies.
 - **Read-only mode.** Set `WHATSAPP_MCP_READ_ONLY=1` in the MCP server's environment and the send tools are not registered at all. Use this if you only want the agent to read and search.
 - **Tool annotations.** Read tools are marked `readOnlyHint`; send tools are marked `openWorldHint` so clients that support it can ask for confirmation.
-- **Dependencies.** Both the Go and Python dependency sets are pinned to versions with no known vulnerabilities as of October 2026 (`govulncheck` and `pip-audit` clean).
+- **Dependencies.** Both the Go and Python dependency sets are pinned to versions with no known vulnerabilities as of October 2026. A GitHub Actions workflow (`.github/workflows/security.yml`) runs `gofmt`, `go vet`, the Go tests, `govulncheck`, the Python end-to-end tests and `pip-audit` on every push and weekly; Dependabot keeps both ecosystems current.
+
+### Running the tests
+
+```bash
+cd whatsapp-bridge && go test ./...
+cd whatsapp-mcp-server && uv run python tests/e2e_test.py .
+```
+
+The Python test spins up the MCP server over stdio against a fake store and a stub bridge, so it needs no WhatsApp account.
 
 ### Configuration reference
 
@@ -169,13 +181,16 @@ This project gives an AI agent read access to your private messages and the abil
 | `WHATSAPP_BRIDGE_ADDR` | bridge | `127.0.0.1:8080` | Listen address. Non-loopback values disable the Host check and expose the API to the network; not recommended |
 | `WHATSAPP_API_BASE_URL` | MCP server | `http://127.0.0.1:8080/api` | Where the MCP server finds the bridge |
 | `WHATSAPP_BRIDGE_STORE` | MCP server | `../whatsapp-bridge/store` | Path to the bridge store directory |
+| `WHATSAPP_ALLOWED_RECIPIENTS` | bridge | *(none)* | Comma-separated numbers/JIDs the agent may message; empty means no restriction |
+| `WHATSAPP_SEND_KNOWN_CHATS_ONLY` | bridge | `0` | `1` only allows sending to chats already in your history |
+| `WHATSAPP_DISABLE_AUDIT_LOG` | bridge | `0` | `1` stops writing `store/send_audit.log` |
 | `WHATSAPP_SEND_RATE_LIMIT` | bridge | `20` | Max sends per minute, `0` to disable |
 | `WHATSAPP_MAX_MEDIA_BYTES` | bridge | `67108864` | Max size of a file to send |
 | `WHATSAPP_API_TIMEOUT` | MCP server | `180` | Seconds to wait for the bridge |
 
 ### What is not covered
 
-- **Prompt injection.** Message content returned to the agent is untrusted. The server tells the model this in its instructions, but that is advice, not enforcement. Read-only mode and the media allow-list are the real controls.
+- **Prompt injection.** Message content returned to the agent is untrusted. The server tells the model this in its instructions, but that is advice, not enforcement. Read-only mode, the recipient controls and the media allow-list are the real controls.
 - **Encryption at rest.** The SQLite databases are not encrypted. Full-disk encryption and the 600/700 permissions are what protect them.
 - **Other processes running as you.** Anything running under your user account can read the token and the databases.
 
@@ -233,6 +248,7 @@ By default, just the metadata of the media is stored in the local database. The 
 - **"Bridge API token not found"** or **HTTP 401**: start the bridge once so it creates `whatsapp-bridge/store/api_token`, or set the same `WHATSAPP_API_TOKEN` for both the bridge and the MCP server. If you moved the store directory, set `WHATSAPP_BRIDGE_STORE` for the MCP server.
 - **"media_path is outside the allowed media directories"**: add the directory to `WHATSAPP_MEDIA_DIRS` for both the bridge and the MCP server, then restart both.
 - **"Send rate limit exceeded"**: the bridge caps sends per minute; raise `WHATSAPP_SEND_RATE_LIMIT` if you need more.
+- **"recipient ... is not in WHATSAPP_ALLOWED_RECIPIENTS"** or **"is not an existing chat"**: the bridge's recipient policy refused the send. Adjust `WHATSAPP_ALLOWED_RECIPIENTS` / `WHATSAPP_SEND_KNOWN_CHATS_ONLY` and restart the bridge.
 
 ### Authentication Issues
 

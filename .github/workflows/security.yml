@@ -1,0 +1,52 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so newly published advisories against pinned versions are caught.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  go-bridge:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: whatsapp-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+          cache-dependency-path: whatsapp-bridge/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  python-mcp-server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: whatsapp-mcp-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Byte-compile
+        run: uv run python -m compileall -q .
+      - name: End-to-end tool tests (stdio, stub bridge)
+        run: uv run python tests/e2e_test.py .
+      - name: pip-audit
+        run: |
+          uv export --format requirements-txt --no-hashes -q -o /tmp/requirements.txt
+          uvx pip-audit -r /tmp/requirements.txt --no-deps --strict

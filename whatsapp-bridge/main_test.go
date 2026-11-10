@@ -279,3 +279,78 @@ func TestAnalyzeOggOpusTruncatedDoesNotPanic(t *testing.T) {
 		t.Error("non-ogg accepted")
 	}
 }
+
+func TestParseRecipientList(t *testing.T) {
+	m, err := parseRecipientList(" 64211234567, 123-456@g.us ,, 999:3@s.whatsapp.net ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"64211234567@s.whatsapp.net", "123-456@g.us", "999@s.whatsapp.net"} {
+		if !m[want] {
+			t.Errorf("missing %q in %v", want, m)
+		}
+	}
+	if len(m) != 3 {
+		t.Errorf("got %d entries, want 3", len(m))
+	}
+	if _, err := parseRecipientList("64211234567,+notanumber"); err == nil {
+		t.Error("invalid entry accepted")
+	}
+	empty, err := parseRecipientList("")
+	if err != nil || len(empty) != 0 {
+		t.Errorf("empty list: %v %v", empty, err)
+	}
+}
+
+func TestRecipientAllowed(t *testing.T) {
+	alice, _ := parseRecipient("64211234567")
+	bob, _ := parseRecipient("64219999999")
+	known := func(jid string) bool { return jid == alice.String() }
+
+	open := &SecurityConfig{}
+	if err := open.recipientAllowed(bob, known); err != nil {
+		t.Errorf("no policy should allow anyone: %v", err)
+	}
+
+	listed := &SecurityConfig{AllowedRecipients: map[string]bool{alice.String(): true}}
+	if err := listed.recipientAllowed(alice, nil); err != nil {
+		t.Errorf("allow-listed recipient rejected: %v", err)
+	}
+	if err := listed.recipientAllowed(bob, nil); err == nil {
+		t.Error("non-listed recipient accepted")
+	}
+
+	knownOnly := &SecurityConfig{KnownChatsOnly: true}
+	if err := knownOnly.recipientAllowed(alice, known); err != nil {
+		t.Errorf("known chat rejected: %v", err)
+	}
+	if err := knownOnly.recipientAllowed(bob, known); err == nil {
+		t.Error("unknown chat accepted")
+	}
+	if err := knownOnly.recipientAllowed(alice, nil); err == nil {
+		t.Error("nil lookup should fail closed")
+	}
+}
+
+func TestAuditLog(t *testing.T) {
+	dir := t.TempDir()
+	sc := &SecurityConfig{AuditLogPath: filepath.Join(dir, "send_audit.log")}
+	sc.audit(auditEntry{Recipient: "1@s.whatsapp.net", Kind: "text", MessageChars: 5, Success: true, Result: "ok"})
+	sc.audit(auditEntry{Recipient: "2@s.whatsapp.net", Kind: "media", Media: "a.jpg", Success: false, Result: "nope"})
+	data, err := os.ReadFile(sc.AuditLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2: %q", len(lines), data)
+	}
+	if !strings.Contains(lines[0], `"recipient":"1@s.whatsapp.net"`) || !strings.Contains(lines[1], `"media":"a.jpg"`) {
+		t.Errorf("unexpected audit content: %q", data)
+	}
+	info, _ := os.Stat(sc.AuditLogPath)
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("audit log perm %o, want 600", perm)
+	}
+	(&SecurityConfig{}).audit(auditEntry{}) // disabled: must not panic or write
+}
