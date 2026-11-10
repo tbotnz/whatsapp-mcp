@@ -134,6 +134,17 @@ class HttpConfig:
     def public_host(self) -> str:
         return urlparse(self.public_url).netloc
 
+    @property
+    def public_origin(self) -> str:
+        p = urlparse(self.public_url)
+        return f"{p.scheme}://{p.netloc}"
+
+    @property
+    def public_path(self) -> str:
+        """Path prefix of the public URL ("" at the root, "/whatsapp" behind a
+        proxy that serves us under a sub-path and strips that prefix)."""
+        return urlparse(self.public_url).path.rstrip("/")
+
     @classmethod
     def from_env(cls, store_dir: Path) -> "HttpConfig":
         public_url = os.environ.get("WHATSAPP_MCP_PUBLIC_URL", "").strip().rstrip("/")
@@ -205,7 +216,7 @@ def build_transport_security(cfg: HttpConfig) -> TransportSecuritySettings:
     for h in os.environ.get("WHATSAPP_MCP_EXTRA_ALLOWED_HOSTS", "").split(","):
         if h.strip():
             hosts.add(h.strip())
-    origins = {cfg.public_url, "https://claude.ai", "https://claude.com"}
+    origins = {cfg.public_origin, "https://claude.ai", "https://claude.com"}
     for r in cfg.allowed_redirects:
         p = urlparse(r)
         origins.add(f"{p.scheme}://{p.netloc}")
@@ -506,7 +517,7 @@ class LocalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
             "<p class='muted'>This will let the connected assistant read your cached WhatsApp messages"
             + (" and, if you tick the box below, send messages as you" if offer_send else "")
             + ".</p>"
-            f"<form method='post' action='/consent'>"
+            f"<form method='post' action='{html.escape(self.cfg.public_path)}/consent'>"
             f"<input type='hidden' name='req' value='{html.escape(req_id)}'>"
             f"<input type='hidden' name='csrf' value='{html.escape(pend['csrf'])}'>"
             f"<label>Enter {hint}<input type='password' name='code' autocomplete='one-time-code' autofocus required></label>"
@@ -560,7 +571,7 @@ class LocalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
                 return RedirectResponse(construct_redirect_uri(redirect_uri, error="access_denied", error_description="Too many failed approval attempts", state=state), status_code=302)
             return self._page(
                 f"<h1 class='warn'>Incorrect code</h1><p>Attempts left: {MAX_ATTEMPTS_PER_REQUEST - pend['attempts']}.</p>"
-                f"<p><a href='/consent?req={html.escape(req_id)}'>Try again</a></p>",
+                f"<p><a href='{html.escape(self.cfg.public_path)}/consent?req={html.escape(req_id)}'>Try again</a></p>",
                 401,
             )
 
