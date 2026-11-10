@@ -3,3 +3,6 @@ claude_desktop_config.json
 whatsapp.log
 # WhatsApp session keys, message history, downloaded media and the API token
 whatsapp-bridge/store/
+
+# local container config
+.env

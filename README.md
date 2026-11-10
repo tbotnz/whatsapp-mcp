@@ -4,7 +4,7 @@ This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
 
-It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
+It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). Messages are held **in memory only** by the bridge process and are sent to an LLM (such as Claude) only when the agent accesses them through tools (which you control). Nothing a message contains is written to disk. Older history is fetched from your phone on demand, the same way WhatsApp Web does it.
 
 Here's an example of what you can do when it's connected to Claude.
 
@@ -129,15 +129,17 @@ Without this setup, you'll likely run into errors like:
 
 This application consists of two main components:
 
-1. **Go WhatsApp Bridge** (`whatsapp-bridge/`): A Go application that connects to WhatsApp's web API, handles authentication via QR code, and stores message history in SQLite. It serves as the bridge between WhatsApp and the MCP server.
+1. **Go WhatsApp Bridge** (`whatsapp-bridge/`): A Go application that connects to WhatsApp's web API, handles authentication via QR code, and keeps a bounded in-memory cache of messages. It exposes an authenticated loopback REST API and is the only component that holds WhatsApp data.
 
-2. **Python MCP Server** (`whatsapp-mcp-server/`): A Python server implementing the Model Context Protocol (MCP), which provides standardized tools for Claude to interact with WhatsApp data and send/receive messages.
+2. **Python MCP Server** (`whatsapp-mcp-server/`): A thin Model Context Protocol (MCP) server that translates tool calls into requests to the bridge. It holds no data and never opens a database.
 
 ### Data Storage
 
-- All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
-- The database maintains tables for chats and messages
-- Messages are indexed for efficient searching and retrieval
+- **Messages live in memory only.** The bridge caches what arrives while it runs (capped by `WHATSAPP_MAX_CACHED_MESSAGES`, default 50,000, oldest evicted first) plus whatever you fetch from the phone. Restarting the bridge empties the cache.
+- **Older history comes from your phone on demand.** WhatsApp has no server-side message store to query (the servers only relay end-to-end encrypted traffic), so the `fetch_older_messages` tool asks your phone for the next batch of older messages in a chat, exactly as WhatsApp Web does when you scroll up. The phone must be online.
+- **On disk, inside `whatsapp-bridge/store/`:** `whatsapp.db` (the WhatsApp session: device identity and encryption keys, required to stay paired), `api_token`, `send_audit.log` (metadata only), any media you explicitly download, and `chat_index.json`.
+- **`chat_index.json` is metadata only:** chat JIDs, display names, timestamps and the IDs of the oldest/newest message seen per chat. It exists so the bridge can still ask the phone for older history after a restart. It contains no message text or media keys. Disable it with `WHATSAPP_PERSIST_CHAT_INDEX=0` if you prefer nothing at all; history fetching then works only for chats that have received a message since startup.
+- If you are upgrading, delete the old `whatsapp-bridge/store/messages.db`; it still holds plaintext history from earlier versions and is no longer read.
 
 ## Security
 
@@ -156,7 +158,7 @@ This project gives an AI agent read access to your private messages and the abil
 - **Output hardening.** Contact and group names are flattened to one printable line and multi-line message bodies are indented before being shown to the agent, so a sender cannot forge a fake "From: Me" line inside the tool output.
 - **Recipient validation.** Phone numbers must be digits only; JIDs must be on a known WhatsApp server.
 - **File permissions.** `store/` is created mode 700 and the databases, token and downloaded media mode 600. `whatsapp.db` holds your Signal session keys: anyone who can read it can act as your WhatsApp account.
-- **Read-only database access.** The MCP server opens `messages.db` read-only; pagination arguments from the agent are clamped.
+- **No message database.** Messages are cached in the bridge's memory and never written to disk. The MCP server has no data access of its own; every read goes through the bridge's authenticated API, so there is one enforcement point for policy, limits and logging. Pagination and fetch sizes from the agent are clamped server-side.
 - **Quiet logs.** The bridge logs message metadata (chat, direction, type), never message bodies.
 - **Read-only mode.** Set `WHATSAPP_MCP_READ_ONLY=1` in the MCP server's environment and the send tools are not registered at all. Use this if you only want the agent to read and search.
 - **Tool annotations.** Read tools are marked `readOnlyHint`; send tools are marked `openWorldHint` so clients that support it can ask for confirmation.
@@ -180,7 +182,10 @@ The Python test spins up the MCP server over stdio against a fake store and a st
 | `WHATSAPP_MCP_READ_ONLY` | MCP server | `0` | `1` disables all send tools |
 | `WHATSAPP_BRIDGE_ADDR` | bridge | `127.0.0.1:8080` | Listen address. Non-loopback values disable the Host check and expose the API to the network; not recommended |
 | `WHATSAPP_API_BASE_URL` | MCP server | `http://127.0.0.1:8080/api` | Where the MCP server finds the bridge |
-| `WHATSAPP_BRIDGE_STORE` | MCP server | `../whatsapp-bridge/store` | Path to the bridge store directory |
+| `WHATSAPP_BRIDGE_STORE` | MCP server | `../whatsapp-bridge/store` | Where to find the bridge's `api_token`; also the default media allow-list entry |
+| `WHATSAPP_MAX_CACHED_MESSAGES` | bridge | `50000` | In-memory cache size; oldest messages are evicted first |
+| `WHATSAPP_PERSIST_CHAT_INDEX` | bridge | `1` | `0` disables the metadata-only `chat_index.json` |
+| `WHATSAPP_HISTORY_TIMEOUT` | bridge | `45` | Seconds to wait for the phone to answer a history request |
 | `WHATSAPP_ALLOWED_RECIPIENTS` | bridge | *(none)* | Comma-separated numbers/JIDs the agent may message; empty means no restriction |
 | `WHATSAPP_SEND_KNOWN_CHATS_ONLY` | bridge | `0` | `1` only allows sending to chats already in your history |
 | `WHATSAPP_DISABLE_AUDIT_LOG` | bridge | `0` | `1` stops writing `store/send_audit.log` |
@@ -191,8 +196,9 @@ The Python test spins up the MCP server over stdio against a fake store and a st
 ### What is not covered
 
 - **Prompt injection.** Message content returned to the agent is untrusted. The server tells the model this in its instructions, but that is advice, not enforcement. Read-only mode, the recipient controls and the media allow-list are the real controls.
-- **Encryption at rest.** The SQLite databases are not encrypted. Full-disk encryption and the 600/700 permissions are what protect them.
-- **Other processes running as you.** Anything running under your user account can read the token and the databases.
+- **Encryption at rest of the session.** `whatsapp.db` is not encrypted. Full-disk encryption and the 600/700 permissions are what protect it, and whoever copies it can request your history from your phone just as the bridge does. Keeping messages out of a database reduces what a casual copy of `store/` exposes; it does not change the value of the session file.
+- **Process memory.** While the bridge runs, cached messages are plaintext in its memory, like any WhatsApp client.
+- **Other processes running as you.** Anything running under your user account can read the token and the session database, or talk to the bridge API.
 
 ## Usage
 
@@ -210,6 +216,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
+- **fetch_older_messages**: Ask your phone for older messages in a chat and add them to the bridge's cache (phone must be online)
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
@@ -231,13 +238,13 @@ You can send various media types to your WhatsApp contacts:
 
 #### Media Downloading
 
-By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+By default, only the media's metadata and decryption info are held in the bridge's memory alongside the message. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the media); this downloads the file into `whatsapp-bridge/store/` and returns the path, which can then be opened or passed to another tool. Downloaded files are the only message content that ever reaches disk, and only because you asked for them.
 
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server
-2. The MCP server queries the Go bridge for WhatsApp data or directly to the SQLite database
-3. The Go accesses the WhatsApp API and keeps the SQLite database up to date
+2. The MCP server calls the Go bridge's authenticated loopback REST API for every read and write
+3. The Go bridge keeps a bounded in-memory cache fed by live WhatsApp events and by on-demand history requests to your phone
 4. Data flows back through the chain to Claude
 5. When sending messages, the request flows from Claude through the MCP server to the Go bridge and to WhatsApp
 
@@ -255,7 +262,9 @@ By default, just the metadata of the media is stored in the local database. The 
 - **QR Code Not Displaying**: If the QR code doesn't appear, try restarting the authentication script. If issues persist, check if your terminal supports displaying QR codes.
 - **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
-- **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
-- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+- **No Messages Loading**: Right after pairing, the phone pushes recent history and it can take a few minutes to arrive. After a restart the cache starts empty: new messages appear as they arrive, and `fetch_older_messages` pulls older ones for a chat from the phone.
+- **"no cached messages for this chat to anchor the request"**: the bridge can only ask the phone for messages older than one it has already seen. Wait for a message in that chat, or make sure `WHATSAPP_PERSIST_CHAT_INDEX` is on so anchors survive restarts.
+- **"timed out waiting for the phone"**: the phone is offline, asleep with background data off, or WhatsApp was force-stopped. Open WhatsApp on the phone and retry.
+- **WhatsApp Out of Sync**: If the bridge cannot connect or decrypt, delete `whatsapp-bridge/store/whatsapp.db` and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.

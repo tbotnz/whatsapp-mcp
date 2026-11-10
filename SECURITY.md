@@ -2,7 +2,7 @@
 
 ## Threat model in one paragraph
 
-This project links an AI agent to your personal WhatsApp account. The agent can read every stored message and, unless disabled, send messages and files as you. The main risks are (1) another process or machine reaching the bridge API, (2) a prompt-injected agent sending private data to an attacker, and (3) someone copying `whatsapp-bridge/store/`, which holds your session keys and message history. The controls for each are described in the [Security section of the README](README.md#security).
+This project links an AI agent to your personal WhatsApp account. The agent can read every cached message and, unless disabled, send messages and files as you. The main risks are (1) another process or machine reaching the bridge API, (2) a prompt-injected agent sending private data to an attacker, and (3) someone copying `whatsapp-bridge/store/`, which holds your session keys. Messages themselves are kept only in the bridge's memory; the on-disk chat index holds metadata, never content. The controls for each risk are described in the [Security section of the README](README.md#security).
 
 ## Reporting a vulnerability
 
@@ -19,4 +19,6 @@ Only the `main` branch is supported. Dependencies are scanned weekly in CI with 
 - Set `WHATSAPP_MCP_READ_ONLY=1` unless you need the agent to send.
 - If you do need sending, set `WHATSAPP_ALLOWED_RECIPIENTS` or `WHATSAPP_SEND_KNOWN_CHATS_ONLY=1`, and only list directories you intend to share in `WHATSAPP_MEDIA_DIRS`.
 - Review `whatsapp-bridge/store/send_audit.log` periodically.
+- Set `WHATSAPP_PERSIST_CHAT_INDEX=0` if you do not even want chat names and JIDs on disk; accept that history fetching then only works for chats active since the bridge started.
+- Delete any leftover `whatsapp-bridge/store/messages.db` from versions before the memory-only cache.
 - Keep `whatsapp-bridge/store/` out of backups that leave the machine unencrypted, and never commit it.

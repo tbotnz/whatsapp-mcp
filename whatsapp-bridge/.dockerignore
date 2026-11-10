@@ -1,0 +1,5 @@
+store/
+*.db
+*.log
+Dockerfile
+.dockerignore

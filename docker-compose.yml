@@ -1,0 +1,91 @@
+# WhatsApp MCP in containers: the Go bridge (WhatsApp session, internal API)
+# and the Python MCP server (OAuth-protected, for claude.ai).
+#
+#   cp .env.example .env            # then set WHATSAPP_MCP_PUBLIC_URL
+#   docker compose up -d --build
+#   docker compose logs -f bridge   # scan the QR code on first start
+#   docker compose logs -f mcp      # approval codes appear here when claude.ai connects
+#
+# Only the MCP server is published, and only on the host's loopback. Put a
+# TLS tunnel or reverse proxy in front of 127.0.0.1:8000 (see README), or
+# enable the bundled cloudflared service:  docker compose --profile tunnel up -d
+services:
+  bridge:
+    build: ./whatsapp-bridge
+    image: whatsapp-mcp/bridge
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WHATSAPP_BRIDGE_ADDR: 0.0.0.0:8080
+    volumes:
+      - store:/data/store
+    # Not published to the host: only the mcp service can reach it.
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  mcp:
+    build: ./whatsapp-mcp-server
+    image: whatsapp-mcp/server
+    restart: unless-stopped
+    init: true
+    depends_on:
+      bridge:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WHATSAPP_BRIDGE_STORE: /data/store
+      WHATSAPP_API_BASE_URL: http://bridge:8080/api
+      WHATSAPP_MCP_TRANSPORT: http
+      WHATSAPP_MCP_HOST: 0.0.0.0
+      WHATSAPP_MCP_PORT: "8000"
+      WHATSAPP_MCP_EXTRA_ALLOWED_HOSTS: mcp:8000
+    volumes:
+      - store:/data/store
+    ports:
+      - "${WHATSAPP_MCP_BIND:-127.0.0.1}:${WHATSAPP_MCP_PORT:-8000}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Optional: Cloudflare Tunnel so claude.ai can reach the server over TLS
+  # without opening any inbound port. Create a tunnel in the Cloudflare
+  # dashboard with public hostname -> http://mcp:8000 and put its token in
+  # CLOUDFLARE_TUNNEL_TOKEN. Protect the hostname with Cloudflare Access if
+  # you can; the built-in OAuth still guards every request behind it.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [tunnel]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - mcp
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  # Session keys, API token, OAuth state, audit logs, downloaded media.
+  store:

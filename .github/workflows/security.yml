@@ -46,6 +46,8 @@ jobs:
         run: uv run python -m compileall -q .
       - name: End-to-end tool tests (stdio, stub bridge)
         run: uv run python tests/e2e_test.py .
+      - name: End-to-end OAuth tests (HTTP transport, stub bridge)
+        run: uv run python tests/oauth_e2e_test.py .
       - name: pip-audit
         run: |
           uv export --format requirements-txt --no-hashes -q -o /tmp/requirements.txt
