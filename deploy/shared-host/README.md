@@ -9,9 +9,9 @@ forwards a dedicated hostname to it. The bridge's port 8080 is
 container-internal, so it cannot clash with anything on the host or in the
 other stack.
 
-Use a dedicated hostname rather than a path under an existing site: the
-server needs `/mcp`, `/.well-known/oauth-*` and the OAuth endpoints at the
-root of its hostname.
+A dedicated hostname is the simplest setup and is what the steps below
+describe. If you cannot add one, the server can also live under a path of an
+existing site; see [Serving under a sub-path](#serving-under-a-sub-path).
 
 ## 1. DNS
 
@@ -74,6 +74,23 @@ Do step 3 before step 4: nginx will not start with a missing certificate.
 
 Add a custom connector with URL `https://whatsapp.example.com/mcp`. The
 approval code appears in `docker compose logs mcp` in this stack.
+
+## Serving under a sub-path
+
+To serve the MCP server at `https://example.com/whatsapp` on a site that
+already exists (and may have its own `/mcp` or OAuth endpoints):
+
+1. Set `WHATSAPP_MCP_PUBLIC_URL=https://example.com/whatsapp` in `.env`. The
+   connector URL becomes `https://example.com/whatsapp/mcp`.
+2. Skip steps 1, 3 and 4 above. Instead include `whatsapp-mcp-subpath.conf`
+   inside the site's existing HTTPS `server` block, then `nginx -t` and reload.
+
+That file strips the prefix before proxying and maps the two OAuth discovery
+documents, which clients request at
+`/.well-known/oauth-protected-resource/whatsapp/mcp` and
+`/.well-known/oauth-authorization-server/whatsapp`. Those are longer prefixes
+than a site's own `/.well-known/oauth-*` locations, so the site's documents
+are unaffected.
 
 ## Notes
 

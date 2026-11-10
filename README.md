@@ -108,8 +108,11 @@ needed. You bring the hostname and TLS in front of port 8000. Any of:
 * **Caddy or nginx** with Let's Encrypt, proxying to `127.0.0.1:8000` and forwarding the original
   `Host` header.
 * **An nginx container that already owns 80/443**: see "Sharing a host" above.
+* **A path on a site you already run**, e.g. `https://example.com/whatsapp`: see
+  [deploy/shared-host](deploy/shared-host/README.md#serving-under-a-sub-path).
 
-`WHATSAPP_MCP_PUBLIC_URL` is `https://your-host`, with no `/mcp` and no trailing slash. A plain
+`WHATSAPP_MCP_PUBLIC_URL` is `https://your-host` (or `https://your-host/prefix`), with no `/mcp` and
+no trailing slash. A plain
 `http` URL is refused unless `WHATSAPP_MCP_ALLOW_INSECURE_HTTP=1` (local testing only).
 
 To approve from your phone without console access, run
