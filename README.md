@@ -42,67 +42,41 @@ a memory-only cache, an authenticated bridge and remote access.
 | `deploy/shared-host/` | Walkthrough and nginx config for that overlay |
 | `SECURITY.md` | Threat model, reporting, hardening checklist |
 
-## Quick start (Claude Desktop, Cursor)
+## Getting started
 
-Needs Go 1.26+, Python 3.11+ and [uv](https://docs.astral.sh/uv/). FFmpeg is optional, for voice
-messages. The bridge pins a patched Go toolchain in `go.mod`; `go` downloads it for you.
+Three steps with Docker Compose. Needs Docker and an HTTPS hostname that reaches port 8000 on this
+machine; [Remote access](#remote-access-from-claudeai) lists the ways to get one.
 
-1. Clone and start the bridge.
+**1. Configure and start.**
 
-   ```bash
-   git clone https://github.com/tbotnz/whatsapp-mcp.git
-   cd whatsapp-mcp/whatsapp-bridge
-   go run .
-   ```
-
-2. Scan the QR code with WhatsApp on your phone (Settings → Linked Devices). The session lasts
-   about 20 days before WhatsApp may ask you to scan again.
-3. Add the MCP server to your client config. `which uv` gives the command, `pwd` in the repo
-   gives the path.
-
-   ```json
-   {
-     "mcpServers": {
-       "whatsapp": {
-         "command": "/path/to/uv",
-         "args": ["--directory", "/path/to/whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"]
-       }
-     }
-   }
-   ```
-
-   Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json`.
-   Cursor: `~/.cursor/mcp.json`.
-4. Restart the client.
-5. Ask Claude: "what did I miss in the family group today?" then "tell Alice I'm running late".
-
-On first run the bridge writes a random API token to `whatsapp-bridge/store/api_token`. The MCP
-server reads it from there, so there is nothing to configure. Hardening options go in an `env`
-block in the same config:
-
-```json
-"env": {
-  "WHATSAPP_MCP_READ_ONLY": "1",
-  "WHATSAPP_MEDIA_DIRS": "/Users/you/Pictures:/Users/you/Documents/to-send"
-}
+```bash
+git clone https://github.com/tbotnz/whatsapp-mcp.git && cd whatsapp-mcp
+cp .env.example .env          # set WHATSAPP_MCP_PUBLIC_URL=https://your-host
+docker compose up -d --build
 ```
 
-**Windows**: the session store uses `go-sqlite3`, which needs CGO and a C compiler. Install one
-with [MSYS2](https://www.msys2.org/) (add `ucrt64\bin` to `PATH`,
-[guide](https://code.visualstudio.com/docs/cpp/config-mingw)), then
-`go env -w CGO_ENABLED=1` before `go run .`. Without it you get
-`Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
+**2. Scan the QR code** with WhatsApp on your phone (Settings → Linked Devices).
+
+```bash
+docker compose logs -f bridge
+```
+
+**3. Add the connector in claude.ai.** Settings → Connectors → Add custom connector, URL
+`https://your-host/mcp`, client ID and secret empty. The consent page asks for an approval code:
+
+```bash
+docker compose logs mcp
+```
+
+That's it. Ask Claude "what did I miss in the family group today?" then "tell Alice I'm running
+late". The connector works in claude.ai on the web, on your phone and in Claude Desktop.
+
+No hostname, or only want it on your own machine? See
+[Running without Docker](#running-without-docker).
 
 ## Docker
 
-For the claude.ai setup. Claude Desktop and Cursor start the MCP server themselves over stdio, so
-for those run both components locally as above.
-
-```bash
-cp .env.example .env          # set WHATSAPP_MCP_PUBLIC_URL, see the next section
-docker compose up -d --build
-docker compose logs -f bridge # scan the QR code on first start
-```
+What `docker compose up` gives you:
 
 * Builds the bridge with CGO inside the Go image. No C toolchain needed on the host.
 * Both containers run unprivileged, read-only root filesystem, all capabilities dropped,
@@ -123,27 +97,24 @@ Docker network instead. Walkthrough in [deploy/shared-host](deploy/shared-host/R
 
 claude.ai (web, mobile, or a Claude Desktop custom connector) needs the server on HTTPS and behind
 OAuth. A small, strict OAuth 2.1 authorization server is built in, so no identity provider is
-needed.
+needed. You bring the hostname and TLS in front of port 8000. Any of:
 
-1. Pick a hostname and put TLS in front of port 8000. Any of:
-   * **Cloudflare Tunnel**, no inbound ports. Create a tunnel with a public hostname pointing at
-     `http://mcp:8000`, put its token in `.env` as `CLOUDFLARE_TUNNEL_TOKEN`, start with
-     `docker compose --profile tunnel up -d`. A Cloudflare Access policy in front is a good extra
-     layer.
-   * **Tailscale Funnel**: `tailscale funnel 8000`. `tailscale serve` is tailnet only and claude.ai
-     cannot reach it.
-   * **Caddy or nginx** with Let's Encrypt, proxying to `127.0.0.1:8000` and forwarding the
-     original `Host` header.
-2. Set `WHATSAPP_MCP_PUBLIC_URL=https://your-host` in `.env`. No `/mcp`, no trailing slash.
-   Without Docker, also set `WHATSAPP_MCP_TRANSPORT=http` and run `uv run python main.py` in
-   `whatsapp-mcp-server/`. A plain `http` public URL is refused unless
-   `WHATSAPP_MCP_ALLOW_INSECURE_HTTP=1` (local testing only).
-3. In claude.ai: Settings → Connectors → Add custom connector, URL `https://your-host/mcp`. Leave
-   client ID and secret empty.
-4. claude.ai opens the consent page. Read the approval code from `docker compose logs mcp`, enter
-   it, choose whether to allow sending, approve.
-5. Optional: `docker compose run --rm mcp python oauth.py hash-password` and put the result in
-   `.env` as `WHATSAPP_MCP_OWNER_PASSWORD_HASH` to approve from your phone without console access.
+* **Cloudflare Tunnel**, no inbound ports. Create a tunnel with a public hostname pointing at
+  `http://mcp:8000`, put its token in `.env` as `CLOUDFLARE_TUNNEL_TOKEN`, and start with
+  `docker compose --profile tunnel up -d --build` instead. A Cloudflare Access policy in front is a
+  good extra layer.
+* **Tailscale Funnel**: `tailscale funnel 8000`. `tailscale serve` is tailnet only and claude.ai
+  cannot reach it.
+* **Caddy or nginx** with Let's Encrypt, proxying to `127.0.0.1:8000` and forwarding the original
+  `Host` header.
+* **An nginx container that already owns 80/443**: see "Sharing a host" above.
+
+`WHATSAPP_MCP_PUBLIC_URL` is `https://your-host`, with no `/mcp` and no trailing slash. A plain
+`http` URL is refused unless `WHATSAPP_MCP_ALLOW_INSECURE_HTTP=1` (local testing only).
+
+To approve from your phone without console access, run
+`docker compose run --rm mcp python oauth.py hash-password` and put the result in `.env` as
+`WHATSAPP_MCP_OWNER_PASSWORD_HASH`. The consent page then takes the password as well as the code.
 
 When you stop using it, remove the connector in claude.ai or run `oauth.py revoke-all`.
 
@@ -168,6 +139,70 @@ How it stays safe:
   `Origin` is not claude.ai, are rejected.
 * **Audit trail.** Registrations, authorization requests, consent grants, denials and failures,
   token issue, refresh and revoke are appended as JSON lines to `store/mcp_auth_audit.log`.
+
+## Running without Docker
+
+For Claude Code, Claude Desktop or Cursor on the same machine. They start the MCP server
+themselves over stdio, so nothing is exposed and no hostname is needed. Needs Go 1.26+ and
+[uv](https://docs.astral.sh/uv/) (uv fetches Python for you).
+
+**1. Start the bridge and scan the QR code** with WhatsApp on your phone (Settings → Linked Devices).
+
+```bash
+git clone https://github.com/tbotnz/whatsapp-mcp.git
+cd whatsapp-mcp/whatsapp-bridge && go run .
+```
+
+**2. Connect Claude.** Leave the bridge running and, in a second terminal, from the repo root:
+
+```bash
+claude mcp add whatsapp -- uv --directory "$PWD/whatsapp-mcp-server" run main.py
+```
+
+That is Claude Code. For Claude Desktop or Cursor, put this in
+`~/Library/Application Support/Claude/claude_desktop_config.json` or `~/.cursor/mcp.json` and
+restart the app (`which uv` gives the command, `pwd` the path):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "/path/to/uv",
+      "args": ["--directory", "/path/to/whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"]
+    }
+  }
+}
+```
+
+**3. Ask Claude.** "What did I miss in the family group today?" then "tell Alice I'm running late".
+
+Good to know:
+
+* The bridge has to stay running. The session lasts about 20 days before WhatsApp may ask you to
+  scan again.
+* FFmpeg is optional, only for sending voice messages.
+* The bridge pins a patched Go toolchain in `go.mod`; `go` downloads it for you.
+* On first run the bridge writes a random API token to `whatsapp-bridge/store/api_token`. The MCP
+  server reads it from there, so there is nothing to configure.
+
+Hardening options go in an `env` block in the same config (or `--env KEY=value` with
+`claude mcp add`):
+
+```json
+"env": {
+  "WHATSAPP_MCP_READ_ONLY": "1",
+  "WHATSAPP_MEDIA_DIRS": "/Users/you/Pictures:/Users/you/Documents/to-send"
+}
+```
+
+To serve claude.ai without Docker, set `WHATSAPP_MCP_TRANSPORT=http` and
+`WHATSAPP_MCP_PUBLIC_URL`, then run `uv run python main.py` in `whatsapp-mcp-server/`.
+
+**Windows**: the session store uses `go-sqlite3`, which needs CGO and a C compiler. Install one
+with [MSYS2](https://www.msys2.org/) (add `ucrt64\bin` to `PATH`,
+[guide](https://code.visualstudio.com/docs/cpp/config-mingw)), then
+`go env -w CGO_ENABLED=1` before `go run .`. Without it you get
+`Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
 ## Tools
 
