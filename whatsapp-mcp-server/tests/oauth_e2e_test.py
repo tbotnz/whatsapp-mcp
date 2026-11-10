@@ -345,10 +345,20 @@ def main():
         res = run_mcp(mcp_url, tok3["access_token"], "send_message", {"recipient": "111", "message": "hi"})
         check(not res.is_error and len(StubBridge.sends) == 1, "send_message works with the send scope")
 
+        # A client that only asks for whatsapp:read is still offered sending, unticked
+        r, verifier, state = authorize(scope="whatsapp:read")
+        req_id = parse_qs(urlparse(r.headers["location"]).query)["req"][0]
+        watcher.next_code(3)
+        page = c.get(f"/consent?req={req_id}").text
+        check("name='allow_send'" in page and "value='1' checked" not in page, "send checkbox is offered but unticked when the client did not ask for it")
+        csrf = re.search(r"name='csrf' value='([^']+)'", page).group(1)
+        r = c.post("/consent", data={"req": req_id, "csrf": csrf, "action": "deny"})
+        check(r.status_code == 302, "cleanup deny")
+
         # Deny path
         r, verifier, state = authorize()
         req_id = parse_qs(urlparse(r.headers["location"]).query)["req"][0]
-        watcher.next_code(3)
+        watcher.next_code(4)
         csrf = re.search(r"name='csrf' value='([^']+)'", c.get(f"/consent?req={req_id}").text).group(1)
         r = c.post("/consent", data={"req": req_id, "csrf": csrf, "action": "deny"})
         q = parse_qs(urlparse(r.headers.get("location", "")).query)
@@ -357,7 +367,7 @@ def main():
         # Brute force: 5 wrong codes kills the request
         r, verifier, state = authorize()
         req_id = parse_qs(urlparse(r.headers["location"]).query)["req"][0]
-        watcher.next_code(4)
+        watcher.next_code(5)
         csrf = re.search(r"name='csrf' value='([^']+)'", c.get(f"/consent?req={req_id}").text).group(1)
         last = None
         for _ in range(5):

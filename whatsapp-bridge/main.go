@@ -286,8 +286,24 @@ func main() {
 		}
 	})
 
+	// Start the API before login so /health answers immediately (containers
+	// and supervisors rely on it). Data endpoints simply return errors until
+	// the WhatsApp session is up.
+	api := &apiServer{
+		client: client,
+		store:  store,
+		sc:     sc,
+		hist:   hist,
+		logger: logger,
+		contacts: func(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
+			return client.Store.Contacts.GetAllContacts(ctx)
+		},
+	}
+	srv := api.start()
+
 	connected := make(chan bool, 1)
 	if client.Store.ID == nil {
+		qrTimeout := time.Duration(envInt("WHATSAPP_QR_TIMEOUT", 180)) * time.Second
 		qrChan, _ := client.GetQRChannel(ctx)
 		if err := client.Connect(); err != nil {
 			logger.Errorf("Failed to connect: %v", err)
@@ -305,8 +321,9 @@ func main() {
 		select {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+		case <-time.After(qrTimeout):
+			logger.Errorf("Timeout waiting for QR code scan (WHATSAPP_QR_TIMEOUT=%ds); exiting so a fresh code is shown on restart", int(qrTimeout.Seconds()))
+			_ = srv.Close()
 			return
 		}
 	} else {
@@ -324,18 +341,6 @@ func main() {
 	}
 	tightenFilePerms(sessionDBPath)
 	fmt.Println("\n✓ Connected to WhatsApp!")
-
-	api := &apiServer{
-		client: client,
-		store:  store,
-		sc:     sc,
-		hist:   hist,
-		logger: logger,
-		contacts: func(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
-			return client.Store.Contacts.GetAllContacts(ctx)
-		},
-	}
-	srv := api.start()
 
 	stopSaver := make(chan struct{})
 	store.StartIndexSaver(15*time.Second, stopSaver, func(err error) { logger.Warnf("Failed to save chat index: %v", err) })

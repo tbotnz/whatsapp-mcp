@@ -9,6 +9,14 @@
 # Only the MCP server is published, and only on the host's loopback. Put a
 # TLS tunnel or reverse proxy in front of 127.0.0.1:8000 (see README), or
 # enable the bundled cloudflared service:  docker compose --profile tunnel up -d
+#
+# On a host where another stack already owns 80/443 (and to publish no host
+# port at all), add the docker-compose.vps.yml overlay: see deploy/shared-host.
+
+# Fixed project name, so container, network and volume names do not depend on
+# the checkout directory or collide with another stack on the same host.
+name: whatsapp-mcp
+
 services:
   bridge:
     build: ./whatsapp-bridge
@@ -16,7 +24,7 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - path: .env
+      - path: ${WHATSAPP_MCP_ENV_FILE:-.env}
         required: false
     environment:
       WHATSAPP_BRIDGE_ADDR: 0.0.0.0:8080
@@ -44,7 +52,7 @@ services:
       bridge:
         condition: service_healthy
     env_file:
-      - path: .env
+      - path: ${WHATSAPP_MCP_ENV_FILE:-.env}
         required: false
     environment:
       WHATSAPP_BRIDGE_STORE: /data/store

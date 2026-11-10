@@ -124,6 +124,7 @@ class HttpConfig:
     refresh_ttl: int
     state_path: Path
     audit_path: Path
+    allow_send: bool = True  # False in read-only mode: the consent page never offers whatsapp:send
 
     @property
     def resource_url(self) -> str:
@@ -172,6 +173,7 @@ class HttpConfig:
             refresh_ttl=max(3600, int(os.environ.get("WHATSAPP_MCP_REFRESH_TOKEN_TTL", str(30 * 86400)))),
             state_path=store_dir / "mcp_oauth_state.json",
             audit_path=store_dir / "mcp_auth_audit.log",
+            allow_send=not _env_bool("WHATSAPP_MCP_READ_ONLY"),
         )
 
 
@@ -492,23 +494,28 @@ class LocalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
             return self._expired_page()
         if self._lockout_active():
             return self._page("<h1>Temporarily locked</h1><p>Too many failed attempts. Try again in a few minutes.</p>", 429)
+        # Clients often request only the scopes advertised as required, so the
+        # owner can always opt in to sending here (unless the server is read-only).
         wants_send = SCOPE_SEND in pend["scopes"]
+        offer_send = self.cfg.allow_send
         hint = "the approval code shown in the bridge's terminal"
         if self.cfg.owner_password_hash:
             hint += " or your owner password"
         body = (
             f"<h1>Allow <strong>{html.escape(pend['client_name'])}</strong> to use your WhatsApp?</h1>"
             "<p class='muted'>This will let the connected assistant read your cached WhatsApp messages"
-            + (" and send messages as you" if wants_send else "")
+            + (" and, if you tick the box below, send messages as you" if offer_send else "")
             + ".</p>"
             f"<form method='post' action='/consent'>"
             f"<input type='hidden' name='req' value='{html.escape(req_id)}'>"
             f"<input type='hidden' name='csrf' value='{html.escape(pend['csrf'])}'>"
             f"<label>Enter {hint}<input type='password' name='code' autocomplete='one-time-code' autofocus required></label>"
             + (
-                "<label class='chk'><input type='checkbox' name='allow_send' value='1' checked> Allow sending messages and files</label>"
-                if wants_send
-                else ""
+                "<label class='chk'><input type='checkbox' name='allow_send' value='1'"
+                + (" checked" if wants_send else "")
+                + "> Allow sending messages and files</label>"
+                if offer_send
+                else "<p class='muted'>This server is read-only; sending is disabled.</p>"
             )
             + "<p class='muted'>Read access is always included. "
             f"Attempts left: {MAX_ATTEMPTS_PER_REQUEST - pend['attempts']}.</p>"
@@ -558,7 +565,7 @@ class LocalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
             )
 
         granted = [SCOPE_READ]
-        if SCOPE_SEND in pend["scopes"] and form.get("allow_send") == "1":
+        if self.cfg.allow_send and form.get("allow_send") == "1":
             granted.append(SCOPE_SEND)
 
         code = secrets.token_urlsafe(32)

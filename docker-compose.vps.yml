@@ -1,0 +1,31 @@
+# Overlay for a host where another stack already owns ports 80/443 (for
+# example an nginx container that terminates TLS for other sites).
+#
+# With this overlay the stack publishes NO host ports at all, so nothing can
+# collide. The MCP server instead joins the existing reverse proxy's Docker
+# network under the DNS name "whatsapp-mcp", and that proxy forwards a
+# hostname to http://whatsapp-mcp:8000 (see deploy/shared-host/README.md).
+#
+# Enable it by adding these lines to .env, after which plain
+# `docker compose up -d --build` picks up both files:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.vps.yml
+#   WHATSAPP_MCP_EDGE_NETWORK=<the reverse proxy's Docker network>
+#
+# Needs Docker Compose 2.24+ (for !reset).
+services:
+  mcp:
+    ports: !reset []
+    networks:
+      # Private network shared with the bridge (unchanged).
+      default: {}
+      # The reverse proxy's network. Only the MCP server joins it; the bridge
+      # and its API stay private to this stack.
+      edge:
+        aliases:
+          - whatsapp-mcp
+
+networks:
+  edge:
+    external: true
+    name: ${WHATSAPP_MCP_EDGE_NETWORK:?set WHATSAPP_MCP_EDGE_NETWORK in .env to the reverse proxy's Docker network (docker network ls)}
