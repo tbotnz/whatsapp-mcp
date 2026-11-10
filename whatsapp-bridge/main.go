@@ -301,7 +301,6 @@ func main() {
 	}
 	srv := api.start()
 
-	connected := make(chan bool, 1)
 	if client.Store.ID == nil {
 		qrTimeout := time.Duration(envInt("WHATSAPP_QR_TIMEOUT", 180)) * time.Second
 		qrChan, _ := client.GetQRChannel(ctx)
@@ -309,29 +308,55 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		// A code is only valid until the next one is printed (about 20 s), and
+		// WhatsApp stops issuing codes after a few minutes. Exit as soon as
+		// pairing can no longer succeed, so the supervisor restarts us with a
+		// fresh code instead of leaving a dead one on screen.
+		timer := time.NewTimer(qrTimeout)
+		defer timer.Stop()
+		paired := false
+		failure := "the QR channel closed"
+	qrLoop:
+		for {
+			select {
+			case evt, ok := <-qrChan:
+				if !ok {
+					break qrLoop
+				}
+				switch evt.Event {
+				case "code":
+					fmt.Println("\nScan this QR code with your WhatsApp app (always the newest one, each lasts about 20 seconds):")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				case "success":
+					paired = true
+					break qrLoop
+				case "timeout":
+					failure = "no code was scanned in time"
+					break qrLoop
+				default:
+					failure = fmt.Sprintf("pairing failed: %s", evt.Event)
+					if evt.Error != nil {
+						failure += ": " + evt.Error.Error()
+					}
+					break qrLoop
+				}
+			case <-timer.C:
+				failure = fmt.Sprintf("no code was scanned within WHATSAPP_QR_TIMEOUT=%ds", int(qrTimeout.Seconds()))
+				break qrLoop
 			}
 		}
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(qrTimeout):
-			logger.Errorf("Timeout waiting for QR code scan (WHATSAPP_QR_TIMEOUT=%ds); exiting so a fresh code is shown on restart", int(qrTimeout.Seconds()))
+		if !paired {
+			logger.Errorf("WhatsApp login did not complete (%s); exiting so a fresh code is shown on restart", failure)
+			client.Disconnect()
 			_ = srv.Close()
 			return
 		}
+		fmt.Println("\nSuccessfully connected and authenticated!")
 	} else {
 		if err := client.Connect(); err != nil {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
 	time.Sleep(2 * time.Second)
